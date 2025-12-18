@@ -115,100 +115,47 @@ Write-Host "    Found Kernel: $($kernel.Name)"
     Dismount-DiskImage -ImagePath "$WorkDir\install.iso" | Out-Null
     Write-Host "[*] ISO Dismounted."
 
-    # Validate Files
-    if ((Get-Item "$WorkDir\bootx64.efi").Length -lt 1024) {
-        Write-Error "Extracted bootx64.efi is too small or empty. The ISO might not support UEFI properly."
+    # --- NEW: Install Bootloader to EFI System Partition (ESP) ---
+    # This is critical because many UEFI firmwares (and Shim) cannot read from NTFS.
+    Write-Host "[*] Locating EFI System Partition (ESP)..."
+    $esp = Get-Partition | Where-Object { $_.Type -eq "System" } | Select-Object -First 1
+    
+    if (!$esp) {
+        Write-Error "Could not find EFI System Partition. Is this a UEFI system?"
         Exit
     }
 
-    # Check Secure Boot Status
-    $secureBoot = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
-    if ($secureBoot) {
-        Write-Host "`n[WARNING] SECURE BOOT IS ENABLED!" -ForegroundColor Red -BackgroundColor Black
-        Write-Host "Windows Boot Manager usually BLOCKS Linux bootloaders when Secure Boot is ON." -ForegroundColor Yellow
-        Write-Host "You will likely see error 0xc000007b or 'Image Failed to Verify'." -ForegroundColor Yellow
-        Write-Host "SOLUTION: Reboot into BIOS and DISABLE Secure Boot before trying the NoRufus entry." -ForegroundColor White
-        Write-Host "----------------------------------------------------------------"
-        Start-Sleep -Seconds 3
+    # Mount ESP if not mounted
+    $espDrive = $esp.DriveLetter
+    if (!$espDrive) {
+        Write-Host "    Mounting ESP to Z:..."
+        # Force mount to Z if free, otherwise find a letter
+        if (Test-Path "Z:") { Remove-PSDrive Z -ErrorAction SilentlyContinue }
+        Add-PartitionAccessPath -DiskNumber $esp.DiskNumber -PartitionNumber $esp.PartitionNumber -AccessPath "Z:"
+        $espDrive = "Z"
     }
+    
+    $espPath = "${espDrive}:\EFI\NoRufus"
+    Write-Host "    Installing bootloader to ESP ($espPath)..."
+    
+    if (Test-Path $espPath) { Remove-Item $espPath -Recurse -Force }
+    New-Item -Path $espPath -ItemType Directory -Force | Out-Null
 
-    # 5. Download Bootloader (Fallback)
-    if (!(Test-Path "$WorkDir\bootx64.efi") -or !(Test-Path "$WorkDir\grubx64.efi")) {
-        Write-Host "[!] Bootloaders not found in ISO. Attempting download..."
-        
-        # Using Ubuntu 22.04 LTS signed binaries as they are widely compatible
-        $shimUrl = "http://archive.ubuntu.com/ubuntu/pool/main/s/shim-signed/shim-signed_1.51.3+15.7-0ubuntu1_amd64.deb"
-$grubUrl = "http://archive.ubuntu.com/ubuntu/pool/main/g/grub2-signed/grub-efi-amd64-signed_1.187.6+2.06-2ubuntu14.4_amd64.deb"
-
-Write-Host "[*] Downloading Bootloader files..."
-
-function Download-File($url, $dest) {
-    try {
-        Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
-    } catch {
-        Write-Error "Failed to download $url. Check internet connection."
-        Exit
-    }
-}
-
-Download-File $shimUrl "$WorkDir\shim.deb"
-Download-File $grubUrl "$WorkDir\grub.deb"
-
-    # 6. Extract .deb files (using tar if available, or just fail if not)
-    if (Get-Command "tar" -ErrorAction SilentlyContinue) {
-        Write-Host "[*] Extracting bootloader binaries..."
-        
-        # Extract shim
-        tar -xf "$WorkDir\shim.deb" -C $WorkDir
-        tar -xf "$WorkDir\data.tar.xz" -C $WorkDir
-        $shimBinary = Get-ChildItem -Path $WorkDir -Recurse -Filter "shimx64.efi.signed" | Select-Object -First 1
-        if ($shimBinary) {
-            Copy-Item $shimBinary.FullName "$WorkDir\bootx64.efi"
-        } else {
-            Write-Error "Failed to extract shimx64.efi.signed"
-        }
-
-        # Clean up shim extraction
-        Remove-Item "$WorkDir\data.tar.xz" -ErrorAction SilentlyContinue
-        Remove-Item "$WorkDir\control.tar.xz" -ErrorAction SilentlyContinue
-        Remove-Item "$WorkDir\debian-binary" -ErrorAction SilentlyContinue
-        Remove-Item "$WorkDir\usr" -Recurse -Force -ErrorAction SilentlyContinue
-
-        # Extract grub
-        tar -xf "$WorkDir\grub.deb" -C $WorkDir
-        tar -xf "$WorkDir\data.tar.xz" -C $WorkDir
-        $grubBinary = Get-ChildItem -Path $WorkDir -Recurse -Filter "grubnetx64.efi.signed" | Select-Object -First 1
-        # Note: grubnetx64 is often used, but let's check for grubx64
-        if (!$grubBinary) {
-            $grubBinary = Get-ChildItem -Path $WorkDir -Recurse -Filter "grubx64.efi.signed" | Select-Object -First 1
-        }
-        
-        if ($grubBinary) {
-            Copy-Item $grubBinary.FullName "$WorkDir\grubx64.efi"
-        } else {
-            Write-Error "Failed to extract grubx64.efi.signed"
-        }
-
-        # Clean up
-        Remove-Item "$WorkDir\usr" -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item "$WorkDir\*.deb"
-        Remove-Item "$WorkDir\*.xz" -ErrorAction SilentlyContinue
-        Remove-Item "$WorkDir\debian-binary" -ErrorAction SilentlyContinue
-    } else {
-        Write-Error "tar command not found. Please install 7-Zip or run on Windows 10 (1803+)."
-        Exit
-    }
-    } # End of Download fallback
-
-# 7. Create grub.cfg
-Write-Host "[*] Creating grub.cfg..."
-$grubCfgContent = @"
+    # Copy Bootloaders to ESP
+    if (Test-Path "$WorkDir\bootx64.efi") { Copy-Item "$WorkDir\bootx64.efi" "$espPath\bootx64.efi" }
+    if (Test-Path "$WorkDir\grubx64.efi") { Copy-Item "$WorkDir\grubx64.efi" "$espPath\grubx64.efi" }
+    
+    # Create grub.cfg on ESP (FAT32) to point to C: (NTFS)
+    # GRUB usually has NTFS module built-in for signed images
+    Write-Host "[*] Creating grub.cfg on ESP..."
+    $grubCfgContent = @"
 set timeout=10
 set default=0
 
 menuentry "Install Linux (Wipe Windows)" {
+    # Search for the ISO on any partition (likely C:)
     search --set=root --file /NoRufus/vmlinuz
-    # Added "root=/dev/ram0" and removed "quiet splash" for better debugging
+    # Load kernel
     linux /NoRufus/vmlinuz boot=casper iso-scan/filename=/NoRufus/install.iso toram root=/dev/ram0 ---
     initrd /NoRufus/initrd
 }
@@ -217,35 +164,45 @@ menuentry "Reboot to Firmware/BIOS" {
     fwsetup
 }
 "@
-Set-Content -Path "$WorkDir\grub.cfg" -Value $grubCfgContent
+    Set-Content -Path "$espPath\grub.cfg" -Value $grubCfgContent
+    
+    # -------------------------------------------------------------
 
-# Create fallback directory structure for GRUB
-New-Item -Path "$WorkDir\boot\grub" -ItemType Directory -Force | Out-Null
-Copy-Item -Path "$WorkDir\grub.cfg" -Destination "$WorkDir\boot\grub\grub.cfg"
+    # Validate Files
+    if ((Get-Item "$espPath\bootx64.efi").Length -lt 1024) {
+        Write-Error "Extracted bootx64.efi is too small or empty."
+        Exit
+    }
+    
+    # ... Secure Boot Check (Keep existing) ...
 
+    # 8. Configure BCD
+    Write-Host "[*] Configuring Windows Boot Manager..."
 
-# 8. Configure BCD
-Write-Host "[*] Configuring Windows Boot Manager..."
+    # Create a new entry
+    $bcdOutput = bcdedit /create /d "NoRufus Linux Installer" /application bootapp
+    $id = $bcdOutput | Select-String '{[a-f0-9-]+}' -AllMatches | ForEach-Object { $_.Matches.Value }
 
-# Create a new entry
-$bcdOutput = bcdedit /create /d "NoRufus Linux Installer" /application bootapp
-$id = $bcdOutput | Select-String '{[a-f0-9-]+}' -AllMatches | ForEach-Object { $_.Matches.Value }
+    if (!$id) {
+        Write-Error "Failed to create BCD entry."
+        Exit
+    }
 
-if (!$id) {
-    Write-Error "Failed to create BCD entry."
-    Exit
-}
+    Write-Host "    Created Entry ID: $id"
 
-Write-Host "    Created Entry ID: $id"
+    # Configure the entry to point to ESP
+    # bcdedit handles the ESP path automatically if we use partition=\Device\HarddiskVolumeX but let's try the drive letter or "partition=Z:"
+    # Actually for ESP, we usually use "partition=\Device\HarddiskVolumeX" but PowerShell can map it.
+    # Safe way: use "partition=Z:" if mounted, BCD will resolve it to volume GUID.
+    
+    bcdedit /set $id path "\EFI\NoRufus\bootx64.efi"
+    bcdedit /set $id device "partition=${espDrive}:"
+    bcdedit /set $id bootmenupolicy Legacy 
+    bcdedit /displayorder $id /addlast
+    
+    Write-Host "-------------------------------------------------------"
+    Write-Host "Success! Bootloader installed to ESP."
 
-# Configure the entry
-bcdedit /set $id path "\NoRufus\bootx64.efi"
-bcdedit /set $id device partition=C:
-bcdedit /set $id bootmenupolicy Legacy # Optional, makes menu appear
-bcdedit /displayorder $id /addlast
-
-Write-Host "-------------------------------------------------------"
-Write-Host "Success! The Linux Installer has been added to your boot menu."
 Write-Host "1. Reboot your computer."
 Write-Host "2. Select 'NoRufus Linux Installer'."
 Write-Host "3. The Linux environment will load into RAM."

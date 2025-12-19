@@ -98,17 +98,20 @@ Write-Host "    Found Kernel: $($kernel.Name)"
     # --- NEW: Extract Bootloaders from ISO ---
     Write-Host "[*] Searching for UEFI Bootloaders in ISO..."
     
-    # Try standard paths first
-    $isoShim = Get-ChildItem -Path $drivePath -Recurse -Include "bootx64.efi", "shimx64.efi" | Sort-Object Length -Descending | Select-Object -First 1
-    $isoGrub = Get-ChildItem -Path $drivePath -Recurse -Include "grubx64.efi" | Sort-Object Length -Descending | Select-Object -First 1
-
-    if ($isoShim) {
-        Write-Host "    Found Shim: $($isoShim.Name)"
-        Copy-Item -Path $isoShim.FullName -Destination "$WorkDir\bootx64.efi"
-    }
-    if ($isoGrub) {
-        Write-Host "    Found Grub: $($isoGrub.Name)"
-        Copy-Item -Path $isoGrub.FullName -Destination "$WorkDir\grubx64.efi"
+    # Copy entire EFI/BOOT folder to capture dependencies (shim, grub, modules)
+    $isoEfiBoot = Join-Path $drivePath "EFI\BOOT"
+    if (Test-Path $isoEfiBoot) {
+        Write-Host "    Found EFI\BOOT folder. Copying to temporary storage..."
+        New-Item -Path "$WorkDir\EFI_COPY" -ItemType Directory -Force | Out-Null
+        Copy-Item -Path "$isoEfiBoot\*" -Destination "$WorkDir\EFI_COPY" -Recurse -Force
+    } else {
+        Write-Warning "Could not find EFI\BOOT folder in ISO. Trying to find .efi files manually..."
+        # Fallback: Find any .efi files
+        $efiFiles = Get-ChildItem -Path $drivePath -Recurse -Filter "*.efi"
+        New-Item -Path "$WorkDir\EFI_COPY" -ItemType Directory -Force | Out-Null
+        foreach ($file in $efiFiles) {
+            Copy-Item -Path $file.FullName -Destination "$WorkDir\EFI_COPY" -Force
+        }
     }
     # ------------------------------------------
 
@@ -141,11 +144,22 @@ Write-Host "    Found Kernel: $($kernel.Name)"
     if (Test-Path $espPath) { Remove-Item $espPath -Recurse -Force }
     New-Item -Path $espPath -ItemType Directory -Force | Out-Null
 
-    # Copy Bootloaders to ESP
-    # Copy extracted BOOTx64.EFI (Shim) to shimx64.efi on ESP
-    if (Test-Path "$WorkDir\bootx64.efi") { Copy-Item "$WorkDir\bootx64.efi" "$espPath\shimx64.efi" }
-    # Copy extracted GRUBx64.EFI to grubx64.efi on ESP
-    if (Test-Path "$WorkDir\grubx64.efi") { Copy-Item "$WorkDir\grubx64.efi" "$espPath\grubx64.efi" }
+    # Copy All Bootloaders to ESP
+    if (Test-Path "$WorkDir\EFI_COPY") {
+        Copy-Item -Path "$WorkDir\EFI_COPY\*" -Destination $espPath -Recurse -Force
+    }
+    
+    # Ensure we have a grubx64.efi and shimx64.efi with standard names
+    # Some ISOs name them bootx64.efi (shim) and grubx64.efi
+    # We need to make sure we know which is which. 
+    # Usually: bootx64.efi IS shim.
+    
+    if (!(Test-Path "$espPath\grubx64.efi")) {
+        # Try to find it in the copied files
+        $g = Get-ChildItem $espPath -Filter "grub*.efi" | Select-Object -First 1
+        if ($g) { Rename-Item $g.FullName "grubx64.efi" }
+    }
+
     
     # Create grub.cfg on ESP (FAT32) to point to C: (NTFS)
     # GRUB usually has NTFS module built-in for signed images
@@ -171,8 +185,8 @@ menuentry "Reboot to Firmware/BIOS" {
     # -------------------------------------------------------------
 
     # Validate Files
-    if ((Get-Item "$espPath\shimx64.efi").Length -lt 1024) {
-        Write-Error "Extracted shimx64.efi is too small or empty."
+    if (!(Test-Path "$espPath\grubx64.efi")) {
+        Write-Error "Could not find grubx64.efi on ESP."
         Exit
     }
     
@@ -193,10 +207,10 @@ menuentry "Reboot to Firmware/BIOS" {
     Write-Host "    Created Entry ID: $id"
 
     # Configure the entry to point to ESP
-    # Pointing to SHIMx64.EFI is the most standard way (it loads grub)
-    
-    bcdedit /set $id path "\EFI\NoRufus\shimx64.efi"
+    # Pointing directly to GRUB to avoid Shim issues (assuming Secure Boot is OFF)
+    bcdedit /set $id path "\EFI\NoRufus\grubx64.efi"
     bcdedit /set $id device "partition=${espDrive}:"
+
     # Removed bootmenupolicy as it causes errors for bootapp
     
     # Force add to display order

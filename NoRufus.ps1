@@ -142,7 +142,9 @@ Write-Host "    Found Kernel: $($kernel.Name)"
     New-Item -Path $espPath -ItemType Directory -Force | Out-Null
 
     # Copy Bootloaders to ESP
-    if (Test-Path "$WorkDir\bootx64.efi") { Copy-Item "$WorkDir\bootx64.efi" "$espPath\bootx64.efi" }
+    # Copy extracted BOOTx64.EFI (Shim) to shimx64.efi on ESP
+    if (Test-Path "$WorkDir\bootx64.efi") { Copy-Item "$WorkDir\bootx64.efi" "$espPath\shimx64.efi" }
+    # Copy extracted GRUBx64.EFI to grubx64.efi on ESP
     if (Test-Path "$WorkDir\grubx64.efi") { Copy-Item "$WorkDir\grubx64.efi" "$espPath\grubx64.efi" }
     
     # Create grub.cfg on ESP (FAT32) to point to C: (NTFS)
@@ -169,8 +171,8 @@ menuentry "Reboot to Firmware/BIOS" {
     # -------------------------------------------------------------
 
     # Validate Files
-    if ((Get-Item "$espPath\bootx64.efi").Length -lt 1024) {
-        Write-Error "Extracted bootx64.efi is too small or empty."
+    if ((Get-Item "$espPath\shimx64.efi").Length -lt 1024) {
+        Write-Error "Extracted shimx64.efi is too small or empty."
         Exit
     }
     
@@ -191,13 +193,13 @@ menuentry "Reboot to Firmware/BIOS" {
     Write-Host "    Created Entry ID: $id"
 
     # Configure the entry to point to ESP
-    # bcdedit handles the ESP path automatically if we use partition=\Device\HarddiskVolumeX but let's try the drive letter or "partition=Z:"
-    # Actually for ESP, we usually use "partition=\Device\HarddiskVolumeX" but PowerShell can map it.
-    # Safe way: use "partition=Z:" if mounted, BCD will resolve it to volume GUID.
+    # Pointing to SHIMx64.EFI is the most standard way (it loads grub)
     
-    bcdedit /set $id path "\EFI\NoRufus\bootx64.efi"
+    bcdedit /set $id path "\EFI\NoRufus\shimx64.efi"
     bcdedit /set $id device "partition=${espDrive}:"
-    bcdedit /set $id bootmenupolicy Legacy 
+    # Removed bootmenupolicy as it causes errors for bootapp
+    
+    # Force add to display order
     bcdedit /displayorder $id /addlast
     
     Write-Host "-------------------------------------------------------"

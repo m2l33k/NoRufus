@@ -150,6 +150,33 @@ Write-Host "    Found: $($isoFile.Name)"
     # Dismount ISO
     Dismount-DiskImage -ImagePath $isoFile.FullName | Out-Null
     
+    # --- FIX BLACK SCREEN: Force Safe Graphics in GRUB ---
+    Write-Host "[*] Patching grub.cfg to force Safe Graphics..."
+    $grubPath = "${targetDriveLetter}:\boot\grub\grub.cfg"
+    if (Test-Path $grubPath) {
+        try {
+            $grubContent = Get-Content $grubPath -Raw
+            # Force nomodeset on default entry by replacing the standard args
+            # This effectively makes the default "Ubuntu" entry behave like "Safe Graphics"
+            if ($grubContent -match "quiet splash ---") {
+                $newGrubContent = $grubContent -replace "quiet splash ---", "quiet splash nomodeset ---"
+                
+                # Increase timeout so user has time to see menu
+                $newGrubContent = $newGrubContent -replace "set timeout=5", "set timeout=30"
+                
+                Set-Content $grubPath $newGrubContent
+                Write-Host "    Success: Enforced 'nomodeset' on default boot entry."
+            } else {
+                 Write-Host "    Note: 'quiet splash ---' pattern not found. Skipping patch."
+            }
+        } catch {
+            Write-Warning "    Failed to patch grub.cfg: $_"
+        }
+    } else {
+        Write-Warning "    Could not find grub.cfg at $grubPath. You may need to manually select 'Safe Graphics'."
+    }
+    # -----------------------------------------------------
+
     # 4. Setup Boot Entry
     # Now we boot from this new partition directly.
     # We need to find the bootloader on the new partition.

@@ -151,13 +151,18 @@ Write-Host "    Found Kernel: $($kernel.Name)"
     
     # Ensure we have a grubx64.efi and shimx64.efi with standard names
     # Some ISOs name them bootx64.efi (shim) and grubx64.efi
-    # We need to make sure we know which is which. 
-    # Usually: bootx64.efi IS shim.
     
-    if (!(Test-Path "$espPath\grubx64.efi")) {
-        # Try to find it in the copied files
-        $g = Get-ChildItem $espPath -Filter "grub*.efi" | Select-Object -First 1
-        if ($g) { Rename-Item $g.FullName "grubx64.efi" }
+    # Define potential source files
+    $shimSource = Get-ChildItem -Path "$WorkDir\EFI_COPY" -Recurse -Include "shimx64.efi", "bootx64.efi" | Sort-Object Length -Descending | Select-Object -First 1
+    $grubSource = Get-ChildItem -Path "$WorkDir\EFI_COPY" -Recurse -Include "grubx64.efi" | Sort-Object Length -Descending | Select-Object -First 1
+    
+    if ($shimSource) { 
+        Copy-Item -Path $shimSource.FullName -Destination "$espPath\shimx64.efi" -Force 
+        Write-Host "    Installed Shim: $($shimSource.Name)"
+    }
+    if ($grubSource) { 
+        Copy-Item -Path $grubSource.FullName -Destination "$espPath\grubx64.efi" -Force 
+        Write-Host "    Installed Grub: $($grubSource.Name)"
     }
 
     
@@ -165,13 +170,24 @@ Write-Host "    Found Kernel: $($kernel.Name)"
     # GRUB usually has NTFS module built-in for signed images
     Write-Host "[*] Creating grub.cfg on ESP..."
     $grubCfgContent = @"
-set timeout=10
+set timeout=30
 set default=0
+set gfxpayload=keep
 
-menuentry "Install Linux (Wipe Windows)" {
-    # Search for the ISO on any partition (likely C:)
+menuentry "Install Linux (Standard)" {
     search --set=root --file /NoRufus/vmlinuz
-    # Load kernel
+    linux /NoRufus/vmlinuz boot=casper iso-scan/filename=/NoRufus/install.iso toram root=/dev/ram0 quiet splash ---
+    initrd /NoRufus/initrd
+}
+
+menuentry "Install Linux (Safe Graphics - nomodeset)" {
+    search --set=root --file /NoRufus/vmlinuz
+    linux /NoRufus/vmlinuz boot=casper iso-scan/filename=/NoRufus/install.iso toram root=/dev/ram0 nomodeset ---
+    initrd /NoRufus/initrd
+}
+
+menuentry "Install Linux (Verbose/Debug)" {
+    search --set=root --file /NoRufus/vmlinuz
     linux /NoRufus/vmlinuz boot=casper iso-scan/filename=/NoRufus/install.iso toram root=/dev/ram0 ---
     initrd /NoRufus/initrd
 }
@@ -182,11 +198,15 @@ menuentry "Reboot to Firmware/BIOS" {
 "@
     Set-Content -Path "$espPath\grub.cfg" -Value $grubCfgContent
     
+    # Copy grub.cfg to standard Ubuntu path just in case (/EFI/ubuntu/grub.cfg is hardcoded sometimes)
+    # But here we are in /EFI/NoRufus.
+    # Some grub builds look for grub.cfg in the same dir.
+    
     # -------------------------------------------------------------
 
     # Validate Files
-    if (!(Test-Path "$espPath\grubx64.efi")) {
-        Write-Error "Could not find grubx64.efi on ESP."
+    if (!(Test-Path "$espPath\shimx64.efi")) {
+        Write-Error "Could not find shimx64.efi on ESP."
         Exit
     }
     
@@ -207,8 +227,8 @@ menuentry "Reboot to Firmware/BIOS" {
     Write-Host "    Created Entry ID: $id"
 
     # Configure the entry to point to ESP
-    # Pointing directly to GRUB to avoid Shim issues (assuming Secure Boot is OFF)
-    bcdedit /set $id path "\EFI\NoRufus\grubx64.efi"
+    # Pointing to SHIMx64.EFI is the most standard way (it loads grub)
+    bcdedit /set $id path "\EFI\NoRufus\shimx64.efi"
     bcdedit /set $id device "partition=${espDrive}:"
 
     # Removed bootmenupolicy as it causes errors for bootapp
